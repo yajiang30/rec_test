@@ -44,18 +44,20 @@ def _build_doc(row: pd.Series) -> str:
     """Combine all metadata fields into one weighted text document.
 
     Fields are repeated to up-weight them relative to the overview prose:
+      title    x2  (helps query-time anchor terms and franchise names)
       genres   x3  (strong signal, clean vocabulary)
       keywords x2
       cast     x2  (underscore-joined so "Tom_Hanks" is one token)
       director x3  (auteur signal)
       overview x1
     """
+    title    = (_to_tokens(row.get("title"))    + " ") * 2
     genres   = (_to_tokens(row.get("genres"))   + " ") * 3
     keywords = (_to_tokens(row.get("keywords")) + " ") * 2
     cast     = (_to_tokens(row.get("cast"))     + " ") * 2
     director = (_to_tokens(row.get("director")) + " ") * 3 if row.get("director") else ""
     overview = str(row.get("overview") or "")
-    return f"{genres}{keywords}{cast}{director} {overview}".strip()
+    return f"{title}{genres}{keywords}{cast}{director} {overview}".strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -121,7 +123,8 @@ class CBFRecommender:
         """
         Return up to k movieIds ranked by cosine similarity to the user profile.
 
-        User profile = mean TF-IDF vector of their history movies.
+        User profile = mean TF-IDF vector of their history movies, optionally
+        blended with the natural-language query when one is available.
         Movies already in history are excluded from results.
         """
         seen = set(history_ids)
@@ -140,6 +143,15 @@ class CBFRecommender:
 
         # cosine similarity against full corpus
         sims = cosine_similarity(profile, self._mat).flatten()  # (N,)
+
+        # Query-aware boost: if the eval query contains usable constraints
+        # (genre, mood, recency, exclusions), let it influence retrieval too.
+        query = (query or "").strip()
+        if query:
+            q_vec = self._vec.transform([query])
+            if q_vec.nnz:
+                q_sims = cosine_similarity(q_vec, self._mat).flatten()
+                sims = (0.75 * sims) + (0.25 * q_sims)
 
         # mask out seen movies
         for mid in seen:
