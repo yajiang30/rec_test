@@ -55,20 +55,12 @@ class CFRecommender:
         movie_ids: np.ndarray,
         item_factors: np.ndarray,
         alpha: float,
-        ratings: pd.DataFrame | None = None,
     ):
         self._model = model
         self._ids = movie_ids                          # (M,)
         self._factors = item_factors                   # (M, F)
         self._alpha = alpha
         self._id2idx: dict[int, int] = {mid: i for i, mid in enumerate(movie_ids)}
-        # userId -> {movieId -> rating} for fold-in confidence weighting
-        self._user_ratings: dict[int, dict[int, float]] = {}
-        if ratings is not None:
-            for uid, grp in ratings.groupby("userId"):
-                self._user_ratings[int(uid)] = dict(
-                    zip(grp["movieId"].astype(int), grp["rating"].astype(float))
-                )
 
     # ---------------------------------------------------------------------- #
     # factory
@@ -96,8 +88,7 @@ class CFRecommender:
             lambda r: (int(r.userId), int(r.movieId)) in heldout, axis=1
         )
         clean = ratings[mask].copy()
-        n_removed = len(ratings) - len(clean)
-        print(f"  ratings: {len(ratings):,} -> {len(clean):,} after removing {n_removed} heldout pairs")
+        print(f"  ratings: {len(ratings):,} -> {len(clean):,} after removing {mask.sum()} heldout pairs")
 
         # --- build item universe from cleaned ratings ---
         movie_ids = clean["movieId"].unique()
@@ -133,37 +124,32 @@ class CFRecommender:
             movie_ids=movie_ids,
             item_factors=model.item_factors,   # (M, F)
             alpha=alpha,
-            ratings=clean,
         )
 
     # ---------------------------------------------------------------------- #
     # recommend
     # ---------------------------------------------------------------------- #
-    def _fold_in(self, history_ids: list[int], movie_ratings: dict[int, float] | None = None) -> np.ndarray:
+    def _fold_in(self, history_ids: list[int], history_ratings: list[float] | None = None) -> np.ndarray:
         """
         Compute a user latent vector by solving one ALS step:
             u = (Y^T C_u Y + λI)^{-1} Y^T C_u p_u
 
         where Y = item factors, C_u = diag(confidence), p_u = 1.
 
-        movie_ratings: {movieId -> raw rating}. Used for confidence weighting;
-                       movies not in the dict default to rating=4.
+        history_ratings: if provided, used as raw rating values for confidence
+                         weighting; otherwise all treated as rating=4 (positive).
         """
         idxs = [self._id2idx[mid] for mid in history_ids if mid in self._id2idx]
         if not idxs:
             return np.zeros(self._factors.shape[1], dtype=np.float32)
 
-        # look up actual rating for each history movie (default 4.0 if unknown)
-        found_ids = [mid for mid in history_ids if mid in self._id2idx]
-        if movie_ratings:
-            ratings_arr = np.array(
-                [movie_ratings.get(mid, 4.0) for mid in found_ids], dtype=np.float32
-            )
+        Y = self._factors[idxs]                 # (H, F)
+        if history_ratings is not None:
+            ratings_arr = np.array([history_ratings[i] for i in range(len(idxs))], dtype=np.float32)
         else:
             ratings_arr = np.full(len(idxs), 4.0, dtype=np.float32)
 
-        Y = self._factors[idxs]                        # (H, F)
-        c = (1.0 + self._alpha * ratings_arr)          # confidence weights
+        c = (1.0 + self._alpha * ratings_arr).astype(np.float32)  # confidence weights
 
         lam = self._model.regularization
         F = Y.shape[1]
@@ -176,18 +162,13 @@ class CFRecommender:
         user_vec = np.linalg.solve(YtCY, YtCp)
         return user_vec.astype(np.float32)
 
-    def recommend(self, query: str, history_ids: list[int], k: int,
-                  user_id: int | None = None) -> list[int]:
+    def recommend(self, query: str, history_ids: list[int], k: int) -> list[int]:
         """
         Return up to k movieIds ranked by inner product with the fold-in user vector.
         Movies in history are excluded.
-
-        user_id: if provided, looks up the user's actual ratings for confidence
-                 weighting in fold-in. Falls back to uniform rating=4 if unknown.
         """
         seen = set(history_ids)
-        movie_ratings = self._user_ratings.get(user_id) if user_id is not None else None
-        user_vec = self._fold_in(history_ids, movie_ratings)
+        user_vec = self._fold_in(history_ids)   # (F,)
 
         # scores: inner product with all item factors
         scores = self._factors @ user_vec       # (M,)
@@ -221,7 +202,7 @@ if __name__ == "__main__":
     from metrics import score_all
     all_scores = []
     for row in splits.head(50).itertuples(index=False):
-        ranked = rec.recommend("", list(row.history_movieIds), k=20, user_id=int(row.userId))
+        ranked = rec.recommend("", list(row.history_movieIds), k=20)
         all_scores.append(score_all(ranked, int(row.heldout_movieId)))
 
     agg = pd.DataFrame(all_scores).mean()
